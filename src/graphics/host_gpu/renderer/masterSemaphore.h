@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <array>
 #include <atomic>
 
 namespace Libs::Graphics {
@@ -31,11 +32,32 @@ public:
 	void Refresh();
 	void Wait(uint64_t tick);
 
+	// Remembers what each submit carried so a device loss can name the in-flight work.
+	void RecordSubmit(uint64_t tick, uint32_t debug_op, uint64_t debug_submit, uint32_t arg0,
+	                  uint32_t arg1, uint32_t arg2, uint32_t arg3, uint64_t arg4,
+	                  uint64_t shader_hash) noexcept;
+
 private:
+	struct SubmitRecord {
+		uint64_t tick         = 0;
+		uint64_t debug_submit = 0;
+		uint64_t arg4         = 0;
+		uint64_t shader_hash  = 0;
+		uint32_t debug_op     = 0;
+		uint32_t arg0         = 0;
+		uint32_t arg1         = 0;
+		uint32_t arg2         = 0;
+		uint32_t arg3         = 0;
+	};
+	static constexpr size_t SubmitHistory = 64;
+
+	void ReportWaitFailure(vk::Result result, uint64_t tick);
+
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::array<SubmitRecord, SubmitHistory> m_submits {};
 };
 
 } // namespace Libs::Graphics

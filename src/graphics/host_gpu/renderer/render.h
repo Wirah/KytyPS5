@@ -104,6 +104,7 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
+	void SetDebugShader(uint64_t shader_hash) noexcept { m_debug_shader_hash = shader_hash; }
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
@@ -130,6 +131,7 @@ private:
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
+	uint64_t            m_debug_shader_hash = 0;
 	uint32_t            m_debug_arg0      = 0;
 	uint32_t            m_debug_arg1      = 0;
 	uint32_t            m_debug_arg2      = 0;

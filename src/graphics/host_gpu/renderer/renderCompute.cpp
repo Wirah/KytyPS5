@@ -305,6 +305,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const auto& program   = *input_info.stage.program;
+	buffer.SetDebugShader(program.shader_hash);
 	const auto& resources = *input_info.stage.resources;
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
@@ -461,6 +462,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
+	buffer.SetDebugShader(program.shader_hash);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}

@@ -110,9 +110,14 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+bool ShaderDumpEnabled() {
+	return Config::GraphicsDebugDumpEnabled() ||
+	       Config::GetShaderLogDirection() == Config::LogDirection::File;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderDumpEnabled()) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -130,7 +135,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!ShaderDumpEnabled()) {
 		return;
 	}
 	EXIT_IF(code.empty());
