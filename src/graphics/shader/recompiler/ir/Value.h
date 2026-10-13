@@ -17,42 +17,91 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Block;
 class Inst;
 
+// The accessors are inline: resource refreshes evaluate retained IR on every draw.
 class Value {
 public:
 	Value() = default;
-	explicit Value(Inst* value);
-	explicit Value(ScalarReg value);
-	explicit Value(VectorReg value);
-	explicit Value(bool value);
-	explicit Value(uint8_t value);
-	explicit Value(uint16_t value);
-	explicit Value(uint32_t value);
-	explicit Value(uint64_t value);
+	explicit Value(Inst* value): type(Type::Opaque), inst(value) {}
+	explicit Value(ScalarReg value): type(Type::ScalarReg), scalar_reg(value) {}
+	explicit Value(VectorReg value): type(Type::VectorReg), vector_reg(value) {}
+	explicit Value(bool value): type(Type::U1), imm_u1(value) {}
+	explicit Value(uint8_t value): type(Type::U8), imm_u8(value) {}
+	explicit Value(uint16_t value): type(Type::U16), imm_u16(value) {}
+	explicit Value(uint32_t value): type(Type::U32), imm_u32(value) {}
+	explicit Value(uint64_t value): type(Type::U64), imm_u64(value) {}
 
-	static Value F16(uint16_t bits);
-	static Value F32(float value);
+	static Value F16(uint16_t bits) { return Value(Type::F16, bits); }
+	static Value F32(float value) { return Value(Type::F32, std::bit_cast<uint32_t>(value)); }
 
-	[[nodiscard]] bool IsEmpty() const;
-	[[nodiscard]] bool IsImmediate() const;
-	[[nodiscard]] bool IsIdentity() const;
-	[[nodiscard]] bool IsPhi() const;
+	[[nodiscard]] bool IsEmpty() const { return type == Type::Void; }
+	[[nodiscard]] bool IsImmediate() const { return type != Type::Opaque; }
+	[[nodiscard]] inline bool IsIdentity() const;
+	[[nodiscard]] inline bool IsPhi() const;
 	[[nodiscard]] Type GetType() const;
 
-	[[nodiscard]] Inst*     Instruction() const;
-	[[nodiscard]] Inst*     TryInstruction() const;
-	[[nodiscard]] Inst*     ResolveInstruction() const;
-	[[nodiscard]] Value     Resolve() const;
-	[[nodiscard]] ScalarReg ScalarRegister() const;
-	[[nodiscard]] VectorReg VectorRegister() const;
-	[[nodiscard]] bool      U1() const;
-	[[nodiscard]] uint8_t   U8() const;
-	[[nodiscard]] uint16_t  U16() const;
-	[[nodiscard]] uint32_t  U32() const;
-	[[nodiscard]] uint64_t  U64() const;
-	[[nodiscard]] uint16_t  F16Bits() const;
-	[[nodiscard]] float     F32Value() const;
+	[[nodiscard]] Inst* Instruction() const {
+		EXIT_IF(type != Type::Opaque);
+		return inst;
+	}
+	[[nodiscard]] Inst* TryInstruction() const { return type == Type::Opaque ? inst : nullptr; }
+	[[nodiscard]] inline Inst*  ResolveInstruction() const;
+	[[nodiscard]] inline Value  Resolve() const;
+	[[nodiscard]] ScalarReg ScalarRegister() const {
+		EXIT_IF(type != Type::ScalarReg);
+		return scalar_reg;
+	}
+	[[nodiscard]] VectorReg VectorRegister() const {
+		EXIT_IF(type != Type::VectorReg);
+		return vector_reg;
+	}
+	[[nodiscard]] bool U1() const {
+		EXIT_IF(type != Type::U1);
+		return imm_u1;
+	}
+	[[nodiscard]] uint8_t U8() const {
+		EXIT_IF(type != Type::U8);
+		return imm_u8;
+	}
+	[[nodiscard]] uint16_t U16() const {
+		EXIT_IF(type != Type::U16);
+		return imm_u16;
+	}
+	[[nodiscard]] uint32_t U32() const {
+		EXIT_IF(type != Type::U32);
+		return imm_u32;
+	}
+	[[nodiscard]] uint64_t U64() const {
+		EXIT_IF(type != Type::U64);
+		return imm_u64;
+	}
+	[[nodiscard]] uint16_t F16Bits() const {
+		EXIT_IF(type != Type::F16);
+		return imm_u16;
+	}
+	[[nodiscard]] float F32Value() const {
+		EXIT_IF(type != Type::F32);
+		return std::bit_cast<float>(imm_u32);
+	}
 
-	bool operator==(const Value& other) const;
+	bool operator==(const Value& other) const {
+		if (type != other.type) {
+			return false;
+		}
+		switch (type) {
+			case Type::Void: return true;
+			case Type::Opaque: return inst == other.inst;
+			case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+			case Type::VectorReg: return vector_reg == other.vector_reg;
+			case Type::U1: return imm_u1 == other.imm_u1;
+			case Type::U8: return imm_u8 == other.imm_u8;
+			case Type::U16:
+			case Type::F16: return imm_u16 == other.imm_u16;
+			case Type::U32:
+			case Type::F32: return imm_u32 == other.imm_u32;
+			case Type::U64: return imm_u64 == other.imm_u64;
+			default: return false;
+		}
+	}
 
 private:
 	Type type = Type::Void;
@@ -67,7 +116,7 @@ private:
 		uint64_t  imm_u64;
 	};
 
-	explicit Value(Type type, uint64_t bits);
+	explicit Value(Type value_type, uint64_t bits): type(value_type), imm_u64(bits) {}
 };
 static_assert(std::is_trivially_copyable_v<Value>);
 
@@ -111,14 +160,22 @@ public:
 	Inst(Inst&&)                 = delete;
 	Inst& operator=(Inst&&)      = delete;
 
-	[[nodiscard]] ValueOpcode             GetOpcode() const;
+	[[nodiscard]] ValueOpcode             GetOpcode() const { return opcode; }
 	[[nodiscard]] Type                    GetType() const;
 	[[nodiscard]] bool                    MayHaveSideEffects() const;
 	[[nodiscard]] bool                    HasUses() const;
 	[[nodiscard]] size_t                  UseCount() const;
-	[[nodiscard]] size_t                  NumArgs() const;
+	[[nodiscard]] size_t                  NumArgs() const {
+		return num_args == PhiArity ? phi_args.size() : num_args;
+	}
 	[[nodiscard]] size_t                  NumPhiBlocks() const;
-	[[nodiscard]] Value                   Arg(size_t index) const;
+	[[nodiscard]] Value                   Arg(size_t index) const {
+		EXIT_IF(index >= NumArgs());
+		if (num_args <= InlineArity) {
+			return fixed_args[index];
+		}
+		return num_args == PhiArity ? phi_args[index].second : large_args[index];
+	}
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
@@ -183,5 +240,32 @@ private:
 };
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	auto* current = inst;
+	while (current->GetOpcode() == ValueOpcode::Identity) {
+		const auto next = current->Arg(0);
+		EXIT_IF(next.type != Type::Opaque);
+		current = next.inst;
+	}
+	return current;
+}
+
+inline Value Value::Resolve() const {
+	auto value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
