@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshDrawRecords.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -625,7 +626,17 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// GPU-written DrawIndexedIndirect arguments of a mesh-emulated draw (see DrawIndexArgs).
+	uint64_t indirect_args = 0;
 };
+
+// DrawIndexedIndirect arguments: index count, instance count, first index, base vertex and
+// first instance.
+constexpr uint64_t IndexedIndirectArgsBytes = 5 * sizeof(uint32_t);
+
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+
+RenderExecutor::~RenderExecutor() = default;
 
 struct DrawIndexBufferSource {
 	uint64_t      address   = 0;
@@ -1097,8 +1108,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool gpu_args    = emit.indirect_args != 0;
+	EXIT_NOT_IMPLEMENTED(gpu_args && (!mesh_active || !draw.IsIndexed() ||
+	                                  state.vertex_info[0].fetch_embedded));
 	uint32_t   mesh_groups = 0;
-	if (mesh_active) {
+	if (mesh_active && !gpu_args) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		EXIT_NOT_IMPLEMENTED(mesh.fast_launch && (draw.IsIndexed() || primitive_restart_enable));
 		static std::atomic_bool restart_warned = false;
@@ -1128,10 +1142,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
-		// synchronizes registered BDA ranges before any draw commands are committed.
+		// synchronizes registered BDA ranges before any draw commands are committed. A draw from
+		// GPU arguments may read anywhere in the index buffer.
 		(void)m_context.GetBufferCache().FindBuffer(
-		    index_source.address, static_cast<uint64_t>(draw.index_count) *
-		                              index_source.guest_element_size);
+		    index_source.address, gpu_args ? index_source.size
+		                                   : static_cast<uint64_t>(draw.index_count) *
+		                                         index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
@@ -1155,6 +1171,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	vk::Buffer args_buffer = nullptr;
+	uint64_t   args_offset = 0;
+	if (gpu_args) {
+		const auto [args, offset] = m_context.GetBufferCache().ObtainBuffer(
+		    emit.indirect_args, IndexedIndirectArgsBytes, false);
+		args_buffer = args->Handle();
+		args_offset = offset;
+	}
+	if (mesh_active && !m_mesh_records) {
+		m_mesh_records = std::make_unique<MeshDrawRecords>(m_context.GetGraphics(),
+		                                                   m_context.GetCommandScheduler());
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1172,6 +1200,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory.
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	MeshDrawRecords::IndirectDraw indirect_draw {};
+	if (gpu_args) {
+		// Build the record and the mesh dispatch from the arguments before any graphics state
+		// is committed; the compute pass cannot run inside rendering.
+		const auto& mesh = state.vertex_info[0].mesh;
+		m_context.GetCommandScheduler().EndRendering();
+		indirect_draw = m_mesh_records->RecordIndirect(
+		    vk_buffer, args_buffer, args_offset, IndexedIndirectArgsBytes,
+		    {.index_limit          = static_cast<uint32_t>(index_source.size /
+		                                                   index_source.guest_element_size),
+		     .element_size         = index_source.guest_element_size,
+		     .index_base           = index_source.address,
+		     .primitive_size       = mesh.InputPrimitiveSize(),
+		     .primitive_step       = mesh.InputPrimitiveStep(),
+		     .primitives_per_group = mesh.primitives_per_group});
+	}
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
@@ -1180,13 +1224,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
-		const uint32_t draw_data[] {
-		    draw.index_count,
-		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
+		// Mesh shaders read the draw's parameter record through the address in dwords 0 and 1.
+		const auto record =
+		    gpu_args ? indirect_draw.record
+		             : m_mesh_records->Write(
+		                   {draw.index_count,
+		                    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+		                                     : emit.first_vertex,
+		                    emit.first_instance, index_source.guest_element_size,
+		                    static_cast<uint32_t>(index_source.address),
+		                    static_cast<uint32_t>(index_source.address >> 32u)});
+		const uint32_t draw_data[] {static_cast<uint32_t>(record),
+		                            static_cast<uint32_t>(record >> 32u), 0, 0, 0, 0};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+		static_assert(MeshDrawRecords::RecordDwords ==
+		              ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
@@ -1210,7 +1262,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	if (gpu_args) {
+		vk_buffer.drawMeshTasksIndirectEXT(indirect_draw.command, indirect_draw.command_offset, 1,
+		                                   sizeof(VkDrawMeshTasksIndirectCommandEXT));
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1310,6 +1365,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
+	if (args.indirect_args != 0) {
+		// The GPU picks the count and first index; any part of the index buffer may be read.
+		EXIT_NOT_IMPLEMENTED(args.index_limit == 0 || index_source.guest_element_size == 1);
+		index_source.size =
+		    static_cast<uint64_t>(args.index_limit) * index_source.guest_element_size;
+	}
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 
 	std::vector<uint16_t> expanded_indices;
@@ -1345,6 +1406,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
 	emit.vertex_offset  = native_indirect ? 0 : vertex_offset + args.base_vertex;
 	emit.first_instance = native_indirect ? 0 : instance_offset;
+	emit.indirect_args  = args.indirect_args;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);

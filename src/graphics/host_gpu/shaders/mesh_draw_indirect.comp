@@ -1,0 +1,74 @@
+#version 450
+
+// Builds a mesh-emulated indexed draw from GPU-written DrawIndexedIndirect arguments, so the
+// CPU never waits for the dispatch that wrote them. Writes the mesh shader's parameter record
+// (the six dwords the CPU path pushes) and a VkDrawMeshTasksIndirectCommandEXT.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer args_buf {
+    uint args[];
+};
+
+layout(std430, binding = 1) writeonly buffer draw_buf {
+    uint draw[];
+};
+
+layout(push_constant) uniform Params {
+    uint args_word;            // First argument dword, relative to binding 0.
+    uint draw_word;            // First record dword, relative to binding 1.
+    uint command_word;         // First command dword, relative to binding 1.
+    uint index_limit;          // INDEX_BUFFER_SIZE in elements.
+    uint element_size;         // Index element size in bytes.
+    uint index_base_low;       // Guest index buffer base.
+    uint index_base_high;
+    uint primitive_size;       // Vertices of the first input primitive.
+    uint primitive_step;       // Vertices added by each further primitive.
+    uint primitives_per_group; // Input primitives per mesh workgroup.
+    uint max_groups_x;
+    uint max_groups_y;
+    uint max_groups_total;
+} params;
+
+void main() {
+    const uint count       = args[params.args_word + 0u];
+    const uint instances   = args[params.args_word + 1u];
+    const uint first_index = args[params.args_word + 2u];
+
+    // The CPU path clamps the count to INDEX_BUFFER_SIZE. Indices past the buffer are never
+    // fetched here, so the registered index range stays the whole buffer.
+    const uint available = first_index < params.index_limit ? params.index_limit - first_index : 0u;
+    const uint index_count = min(count, available);
+
+    uint carry = 0u;
+    const uint address_low = uaddCarry(params.index_base_low, first_index * params.element_size, carry);
+    const uint address_high = params.index_base_high + carry;
+
+    const uint primitives = index_count < params.primitive_size
+        ? 0u
+        : (index_count - params.primitive_size) / params.primitive_step + 1u;
+    uint groups = primitives == 0u ? 0u : (primitives - 1u) / params.primitives_per_group + 1u;
+    uint rows = instances;
+    // The CPU path stops on oversized draws; the GPU path skips them.
+    uint total_high = 0u;
+    uint total_low  = 0u;
+    umulExtended(groups, rows, total_high, total_low);
+    if (groups == 0u || rows == 0u || groups > params.max_groups_x || rows > params.max_groups_y ||
+        total_high != 0u || total_low > params.max_groups_total) {
+        groups = 0u;
+        rows   = 0u;
+    }
+
+    // Native indirect draws take their vertex and instance offsets from shader registers, so the
+    // record's offsets stay zero, as in the CPU path.
+    draw[params.draw_word + 0u] = index_count;
+    draw[params.draw_word + 1u] = 0u;
+    draw[params.draw_word + 2u] = 0u;
+    draw[params.draw_word + 3u] = params.element_size;
+    draw[params.draw_word + 4u] = address_low;
+    draw[params.draw_word + 5u] = address_high;
+
+    draw[params.command_word + 0u] = groups;
+    draw[params.command_word + 1u] = rows;
+    draw[params.command_word + 2u] = groups == 0u ? 0u : 1u;
+}

@@ -157,6 +157,8 @@ private:
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	// The NUM_INSTANCES state, read from guest memory if a GPU-args draw left it there.
+	[[nodiscard]] uint32_t NumInstances();
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
@@ -172,6 +174,8 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// A draw from GPU-written arguments leaves the instance count in guest memory; read on demand.
+	uint64_t m_num_instances_address = 0;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

@@ -729,7 +729,10 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	// Mesh shaders read their draw parameter record through a device address.
+	const bool physical_pointers =
+	    state.program.info.uses_dma || state.program.stage == ShaderType::Mesh;
+	if (physical_pointers) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -790,9 +793,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
-	                                 ? spv::AddressingModelPhysicalStorageBuffer64
-	                                 : spv::AddressingModelLogical,
+	state.builder.AddMemoryModel(physical_pointers ? spv::AddressingModelPhysicalStorageBuffer64
+	                                               : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.

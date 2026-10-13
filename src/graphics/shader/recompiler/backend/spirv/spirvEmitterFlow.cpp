@@ -653,17 +653,32 @@ uint32_t EmitLaneId(EmitterState& state) {
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
-	const auto result = state.builder.AllocateId();
-	const auto index  = inst.Arg(0).U32();
+	auto&      state = ctx.state;
+	const auto index = inst.Arg(0).U32();
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	const auto pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer,
-	                          state.push_constant_variable, ConstantU32(state, 0),
-	                          ConstantU32(state, index));
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer);
+	// Push-constant dwords 0 and 1 hold the device address of the draw's parameter record, so a
+	// draw whose parameters the GPU computes from indirect arguments can use the same pipeline.
+	const auto push_dword = [&](uint32_t dword) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, dword));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	auto address = PackU64(state, push_dword(0), push_dword(1));
+	if (index != 0) {
+		address = Binary(state, spv::OpIAdd, TypeU64(state), address,
+		                 ConstantU64(state, uint64_t {index} * sizeof(uint32_t)));
+	}
+	const auto pointer =
+	    Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), address);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), result, pointer,
+	                          spv::MemoryAccessAlignedMask, 4u);
 	return result;
 }
 
