@@ -399,6 +399,64 @@ bool IsCursorActivity(const SDL_Event& event) {
 	return which != SDL_TOUCH_MOUSEID && which != SDL_PEN_MOUSEID;
 }
 
+// KYTY_AUTO_PRESS=<Control>:<period ms>, e.g. "Cross:2000", taps a control (named as in --keymap)
+// on that period, so test runs get through menus and keep playing unattended.
+struct AutoPress {
+	static constexpr uint64_t HOLD_MS = 150;
+
+	std::size_t control    = INVALID_CONTROL;
+	uint64_t    period_ms  = 0;
+	uint64_t    next_ms    = 0; // Next press.
+	uint64_t    release_ms = 0; // Pending release; 0 while released.
+};
+
+AutoPress& GetAutoPress() {
+	static AutoPress auto_press = [] {
+		AutoPress result;
+		const char* value = std::getenv("KYTY_AUTO_PRESS");
+		if (value == nullptr) {
+			return result;
+		}
+		const std::string_view text {value};
+		const auto             colon  = text.find(':');
+		const auto             period = colon == std::string_view::npos
+		                                    ? 0
+		                                    : std::strtoull(value + colon + 1, nullptr, 10);
+		result.control = ControlFromName(text.substr(0, colon));
+		if (result.control == INVALID_CONTROL || period <= AutoPress::HOLD_MS) {
+			LOGF("KYTY_AUTO_PRESS ignored, expected <Control>:<period ms>: %s\n", value);
+			result.control = INVALID_CONTROL;
+			return result;
+		}
+		result.period_ms = period;
+		result.next_ms   = SDL_GetTicks() + period;
+		LOGF("KYTY_AUTO_PRESS: %s every %llu ms\n", value,
+		     static_cast<unsigned long long>(period));
+		return result;
+	}();
+	return auto_press;
+}
+
+// Presses or releases the auto-pressed control when due. Returns the wait until the next change,
+// or -1 when nothing is scheduled.
+int UpdateAutoPress(uint64_t now_ms) {
+	auto& auto_press = GetAutoPress();
+	if (auto_press.control == INVALID_CONTROL) {
+		return -1;
+	}
+	if (auto_press.release_ms != 0 && now_ms >= auto_press.release_ms) {
+		SetControl(auto_press.control, false);
+		auto_press.release_ms = 0;
+	}
+	if (auto_press.release_ms == 0 && now_ms >= auto_press.next_ms) {
+		SetControl(auto_press.control, true);
+		auto_press.release_ms = now_ms + AutoPress::HOLD_MS;
+		auto_press.next_ms    = now_ms + auto_press.period_ms;
+	}
+	const auto due = auto_press.release_ms != 0 ? auto_press.release_ms : auto_press.next_ms;
+	return due > now_ms ? static_cast<int>(due - now_ms) : 0;
+}
+
 } // namespace
 
 void HostInputInit(SDL_Window* window) {
@@ -472,6 +530,9 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 		const int  cursor_timeout =
 		    now_ms < g_cursor_hide_at ? static_cast<int>(g_cursor_hide_at - now_ms) : 0;
 		timeout = timeout < 0 ? cursor_timeout : std::min(timeout, cursor_timeout);
+	}
+	if (const int auto_timeout = UpdateAutoPress(SDL_GetTicks()); auto_timeout >= 0) {
+		timeout = timeout < 0 ? auto_timeout : std::min(timeout, auto_timeout);
 	}
 	timeout              = timeout < 0 ? max_wait_ms : std::min(timeout, max_wait_ms);
 	const bool has_event = SDL_WaitEventTimeout(event, timeout);
