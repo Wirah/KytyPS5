@@ -79,6 +79,9 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
+		return m_memory_tracker.IsPageGpuDirtyHint(vaddr);
+	}
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();

@@ -110,6 +110,14 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
+// Per-draw resource tables can share a tracker page with GPU-written data, which protects the
+// whole page. Reading their clean bytes from the backing avoids a fault and a GPU wait; bytes
+// the GPU did write still read back.
+bool ReadShaderGuestMemoryOnGpuThread(void*, uint64_t address, std::span<uint32_t> values) {
+	Libs::LibKernel::Memory::ReadGuestOnGpuThread(address, values.data(), values.size_bytes());
+	return true;
+}
+
 bool ShaderDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() ||
 	       Config::GetShaderLogDirection() == Config::LogDirection::File;
@@ -345,6 +353,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {

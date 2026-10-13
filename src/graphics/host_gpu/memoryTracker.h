@@ -29,6 +29,16 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Lock-free and possibly stale: whether the tracker page holding vaddr is GPU-dirty. Only
+	// for choosing a read path whose outcome stays correct either way.
+	[[nodiscard]] bool IsPageGpuDirtyHint(uint64_t vaddr) const noexcept {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (index >= REGION_COUNT) {
+			return false;
+		}
+		const auto* manager = m_regions[index].load(std::memory_order_acquire);
+		return manager != nullptr && manager->GpuDirtyHint(vaddr);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

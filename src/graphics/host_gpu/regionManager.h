@@ -145,6 +145,11 @@ public:
 		}
 	}
 
+	// Lock-free and possibly stale: whether the page holding vaddr is GPU-dirty.
+	[[nodiscard]] bool GpuDirtyHint(uint64_t vaddr) const noexcept {
+		return m_gpu_dirty.GetRelaxed((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
+	}
+
 	TrackingSpinLock lock;
 
 private:
