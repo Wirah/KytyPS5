@@ -56,6 +56,11 @@ void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// While set on this thread, walkers interpret the retained IR directly instead of its compiled
+// nodes. MaterializeResources uses it to check the nodes (KYTY_VERIFY_SRT_NODES=1).
+void SetSrtReferenceEvaluation(bool reference) noexcept;
+[[nodiscard]] bool SrtReferenceEvaluation() noexcept;
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
@@ -74,6 +79,14 @@ private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
 	static float Float32(uint64_t bits);
 	bool EvaluateWide(Value value, uint64_t& result);
+
+	// Compiled nodes (the default).
+	bool EvaluateNode(uint32_t index, uint64_t& result);
+	bool EvaluateNodeInst(uint32_t index, const SrtNode& node, uint64_t& result);
+	bool EvaluateNodeRawRead(const SrtNode& node, uint64_t& result);
+
+	// Reference interpreter over the retained IR.
+	bool EvaluateWideReference(Value value, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
@@ -84,7 +97,9 @@ private:
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	uint32_t                        m_active_node = SrtNode::None;
 	ResourcePlan::EvaluationContext& m_context;
+	bool                            m_reference = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

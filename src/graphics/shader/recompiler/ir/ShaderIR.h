@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Xbyak {
@@ -564,6 +565,27 @@ struct UniformFillPlan {
 	std::array<Value, 4> values;
 };
 
+// One retained IR value compiled for SrtWalker: arguments already resolved to node indices and
+// immediates already converted, laid out contiguously.
+struct SrtNode {
+	static constexpr uint32_t None = UINT32_MAX;
+
+	enum class Kind : uint8_t {
+		Constant,    // `data` is the value.
+		Fail,        // Evaluation fails (an immediate type the walker cannot read).
+		Exit,        // Malformed IR the reference walker stops on when it reaches it.
+		Instruction, // Evaluated by opcode.
+	};
+
+	Kind                    kind   = Kind::Fail;
+	ValueOpcode             op     = ValueOpcode::Void;
+	uint8_t                 extra  = 0; // Opcode-specific compile-time facts.
+	uint32_t                memo   = 0; // EvaluationIndex of an instruction.
+	std::array<uint32_t, 6> args {};    // Opcode-specific operand nodes.
+	uint64_t                data   = 0;
+	const Inst*             inst   = nullptr;
+};
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -611,6 +633,15 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Evaluation nodes compiled from the retained values on first use, and the node of each
+	// SRT read, block condition and descriptor dword.
+	mutable std::vector<SrtNode>                      srt_nodes;
+	mutable std::unordered_map<const Inst*, uint32_t> srt_inst_nodes;
+	mutable std::vector<std::pair<Value, uint32_t>>   srt_constant_nodes;
+	mutable std::vector<uint32_t>                     srt_read_nodes;
+	mutable std::vector<uint8_t>                      srt_read_clean;
+	mutable std::vector<uint32_t>                     srt_condition_nodes;
+	mutable std::vector<std::array<uint32_t, 8>>      srt_descriptor_nodes;
 };
 
 struct Program: ResourcePlan {

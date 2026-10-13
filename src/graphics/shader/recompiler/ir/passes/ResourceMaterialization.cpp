@@ -9,7 +9,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
@@ -1074,8 +1076,47 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot&       snapshot,
+                                     ResourceSpecialization& specialization);
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	// KYTY_VERIFY_SRT_NODES=1 also refreshes through the reference interpreter and stops on any
+	// difference from the compiled nodes.
+	static const bool verify = std::getenv("KYTY_VERIFY_SRT_NODES") != nullptr;
+	if (!verify || SrtReferenceEvaluation()) {
+		return MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	}
+	ResourceSnapshot       reference_snapshot;
+	ResourceSpecialization reference_specialization;
+	SetSrtReferenceEvaluation(true);
+	const bool reference_ok = MaterializeResourcesOnce(program, runtime, reference_snapshot,
+	                                                   reference_specialization);
+	SetSrtReferenceEvaluation(false);
+	const bool ok = MaterializeResourcesOnce(program, runtime, snapshot, specialization);
+	const bool same =
+	    ok == reference_ok &&
+	    (!ok || (snapshot.buffers == reference_snapshot.buffers &&
+	             snapshot.images == reference_snapshot.images &&
+	             snapshot.samplers == reference_snapshot.samplers &&
+	             snapshot.flattened_srt == reference_snapshot.flattened_srt &&
+	             snapshot.user_data == reference_snapshot.user_data &&
+	             snapshot.specialization_reads == reference_snapshot.specialization_reads &&
+	             snapshot.uniform_fill == reference_snapshot.uniform_fill &&
+	             specialization == reference_specialization));
+	if (!same) {
+		EXIT("SRT nodes differ from the reference walker: shader=0x%016" PRIx64
+		     " stage=%u ok=%d reference_ok=%d\n",
+		     program.shader_hash, static_cast<uint32_t>(program.stage), ok ? 1 : 0,
+		     reference_ok ? 1 : 0);
+	}
+	return ok;
+}
+
+static bool MaterializeResourcesOnce(const ResourcePlan& program, const SrtRuntime& runtime,
+                                     ResourceSnapshot&       snapshot,
+                                     ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
 	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
 	     runtime.read_specialization_memory == nullptr)) {
