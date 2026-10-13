@@ -31562,6 +31562,38 @@ TestCase FlatLoadDlcCaptured(u32 wave_size) {
   return test;
 }
 
+// A loop waiting for a nonzero DMA value. An unmapped page reads as zero, so without the
+// fault exit the dispatch never finishes; the store after the loop must then be skipped.
+TestCase DmaFaultExitsDataDrivenLoop(u32 wave_size, bool mapped) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = mapped ? (wave_size == 64 ? "DmaMappedLoopWave64" : "DmaMappedLoopWave32")
+                     : (wave_size == 64 ? "DmaFaultExitsLoopWave64" : "DmaFaultExitsLoopWave32");
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1))); // S_MOV_B64 exec, 1.
+  AppendVMovU32(&code, 4, mapped ? 0u : 0x00100000u);
+  AppendVMovU32(&code, 5, 31);
+  const auto loop = code.size();
+  code.insert(code.end(), {0xdc300000u, 0x007d0004u}); // FLAT_LOAD_DWORD v0, v[4:5].
+  code.push_back(EncodeSopp(0x0c, 0));                  // S_WAITCNT 0.
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 0));   // V_CMP_NE_U32 vcc, 0, v0.
+  code.push_back(EncodeSopp(0x06, static_cast<u32>(loop - code.size() - 1) & 0xffffu));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+  test.initial = {0xdeadbeefu, 0, 0, 0, 0, 0, 0, 0, 5};
+  test.expected = {mapped ? 5u : 0xdeadbeefu, 0, 0, 0, 0, 0, 0, 0, 5};
+  test.bda_mappings = {{0x1f00000000ull, 32}};
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::S_WAITCNT,
+                  O::V_CMP_NE_U32, O::S_CBRANCH_VCCZ, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformAny"};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase FlatStoreSlcCaptured() {
   TestCase test;
   test.name = "FlatStoreSlcCaptured";
@@ -37827,6 +37859,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(TBufferStoreVariants);
   cases.push_back(FlatLoadDlcCaptured(32));
   cases.push_back(FlatLoadDlcCaptured(64));
+  for (const bool mapped : {true, false}) {
+    cases.push_back(DmaFaultExitsDataDrivenLoop(32, mapped));
+    cases.push_back(DmaFaultExitsDataDrivenLoop(64, mapped));
+  }
   AddCase(FlatStoreSlcCaptured);
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);

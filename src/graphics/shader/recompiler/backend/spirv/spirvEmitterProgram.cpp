@@ -88,6 +88,68 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// A guest page missing from the BDA page table reads as zero until the fault buffer is
+// processed after the submit. Loops driven by that data, such as BVH traversal waiting for an
+// end-of-list bit, then never terminate and the device is lost. A subgroup that faulted already
+// produces throwaway results, so it leaves at the next loop iteration instead.
+bool UsesDmaFaultExit(const EmitterState& state) {
+	if (!state.program.info.uses_dma || state.program.stage == ShaderType::Mesh) {
+		return false;
+	}
+	if (state.program.stage != ShaderType::TessellationControl &&
+	    ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
+		return true;
+	}
+	// Returning early would leave the rest of the workgroup waiting at a barrier.
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool IsFaultCheckedLoopHeader(const EmitterState& state, const IR::Block* block) {
+	const auto& term = block->terminator;
+	return state.dma_fault_variable != 0 && term.loop_header &&
+	       term.kind == CFG::TerminatorKind::Branch && term.true_block != nullptr &&
+	       term.merge_block != nullptr && term.continue_block != nullptr;
+}
+
+// Every iteration passes through a check block placed between the loop header and its
+// successor. That block is in the loop construct even when the successor is the continue
+// target, where a return would not be structured control flow. The check is subgroup-uniform
+// so emulated waves stay converged.
+void EmitFaultCheckedLoopHeader(ValueEmitContext& ctx, StructuredFunctionState& structured,
+                                const IR::Block* block) {
+	auto&       state = ctx.state;
+	const auto& term  = block->terminator;
+	const auto  check_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoopMerge, term.merge_block->Definition(),
+	                          term.continue_block->Definition(), spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranch, check_label);
+	EmitLabel(state, check_label);
+
+	const auto faulted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeBool(state), faulted, state.dma_fault_variable);
+	const auto any = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), any,
+	                          ConstantU32(state, spv::ScopeSubgroup), faulted);
+	const auto exit_label   = state.builder.AllocateId();
+	const auto resume_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, resume_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, any, exit_label, resume_label);
+	EmitLabel(state, exit_label);
+	EmitReturn(ctx);
+	EmitLabel(state, resume_label);
+
+	// The successor's phis now see the check block as the header's exit.
+	structured.block_exit_labels.emplace(block, state.current_label);
+	state.builder.AddFunction(spv::OpBranch, term.true_block->Definition());
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
@@ -330,6 +392,10 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		if (IsFaultCheckedLoopHeader(ctx.state, block)) {
+			EmitFaultCheckedLoopHeader(ctx, structured, block);
+			continue;
+		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
 	}
@@ -664,6 +730,14 @@ void EmitProgram(EmitterState& state) {
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
 	}
+	if (!state.program.dispatcher_fallback && UsesDmaFaultExit(state)) {
+		state.dma_fault_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeBool(state)),
+		    spv::StorageClassPrivate);
+		state.builder.AddName(state.dma_fault_variable, "dma_faulted");
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	}
 	DefineGetBdaPointer(state);
 	DefineBvhIntersect(state);
 	if (program.info.uses_swizzle) {
@@ -723,6 +797,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.dma_fault_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.dma_fault_variable,
+		                          ConstantBool(state, false));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
