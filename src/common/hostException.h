@@ -39,6 +39,9 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// From a handler: resume the faulting thread at `rip` instead of the faulting instruction.
+void SetInstructionPointer(const ExceptionInfo& info, uint64_t rip);
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif

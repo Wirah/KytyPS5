@@ -18,7 +18,14 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Lets a compiled walker load ordinary reads directly although read_memory is set. A load
+	// that faults (a page the GPU wrote) abandons the compiled walk for read_memory.
+	bool                      compiled_reads = false;
 };
+
+// From the host fault handler: whether `pc` is in a compiled walker running on this thread with
+// fault recovery. If so, `resume_pc` is its failure exit, where the faulting thread continues.
+[[nodiscard]] bool RecoverCompiledWalkerFault(uint64_t pc, uint64_t& resume_pc) noexcept;
 
 class SrtReadCapture {
 public:

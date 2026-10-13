@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -664,6 +665,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
+		}
+		// A compiled SRT walker read a page the GPU wrote: let it fall back to its checked reads
+		// instead of waiting for the GPU to publish the page.
+		uint64_t resume_pc = 0;
+		if (access == GpuAccess::Read &&
+		    Libs::Graphics::ShaderRecompiler::IR::RecoverCompiledWalkerFault(info->exception_address,
+		                                                                      resume_pc)) {
+			Common::HostException::SetInstructionPointer(*info, resume_pc);
+			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

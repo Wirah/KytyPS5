@@ -16,9 +16,33 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+namespace {
+
+// The compiled walker running on this thread with fault recovery.
+struct CompiledWalkerGuard {
+	uint64_t begin   = 0;
+	uint64_t end     = 0;
+	uint64_t failure = 0;
+};
+
+thread_local CompiledWalkerGuard* g_compiled_walker = nullptr;
+
+} // namespace
+
+bool RecoverCompiledWalkerFault(uint64_t pc, uint64_t& resume_pc) noexcept {
+	auto* guard = g_compiled_walker;
+	if (guard == nullptr || pc < guard->begin || pc >= guard->end) {
+		return false;
+	}
+	resume_pc = guard->failure;
+	return true;
+}
+
 SrtRuntime SrtReadCapture::ObservedRuntime() {
 	auto runtime = m_source;
 	runtime.userdata = this;
+	// Captured reads must go through the capture.
+	runtime.compiled_reads = false;
 	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
 	                                         ? ReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
@@ -46,6 +70,7 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 }
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	runtime.compiled_reads = false;
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -487,6 +512,8 @@ void CompileSrtWalker(ResourcePlan& program) {
 	code.ret();
 	code.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
+	program.srt_code_failure = reinterpret_cast<uint64_t>(failed.getAddress());
+	EXIT_IF(program.srt_code_failure == 0);
 }
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -1084,14 +1111,31 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
-	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
+	if (m_program.srt_code && (m_runtime.read_memory == nullptr || m_runtime.compiled_reads)) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);
 		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
 		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
-		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		const auto walk = m_program.srt_code->getCode<Walker>();
+		if (m_runtime.read_memory == nullptr) {
+			return walk(m_runtime.user_data.data(), flat.data(), m_context.values.data(),
+			            m_context.generation, m_runtime.user_data.size());
+		}
+		// The compiled loads bypass read_memory. A load from a page the GPU wrote faults; the
+		// fault handler resumes at the walker's failure exit and the walk below repeats it
+		// through read_memory. Values the compiled walk memoized came from readable pages.
+		const auto begin = reinterpret_cast<uint64_t>(m_program.srt_code->getCode());
+		CompiledWalkerGuard guard {.begin   = begin,
+		                           .end     = begin + m_program.srt_code->getSize(),
+		                           .failure = m_program.srt_code_failure};
+		g_compiled_walker = &guard;
+		const bool walked = walk(m_runtime.user_data.data(), flat.data(), m_context.values.data(),
+		                         m_context.generation, m_runtime.user_data.size());
+		g_compiled_walker = nullptr;
+		if (walked) {
+			return true;
+		}
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;

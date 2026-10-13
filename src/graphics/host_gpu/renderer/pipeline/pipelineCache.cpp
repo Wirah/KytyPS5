@@ -355,6 +355,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryOnGpuThread,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .compiled_reads             = true,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;

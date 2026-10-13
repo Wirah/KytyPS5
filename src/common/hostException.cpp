@@ -338,4 +338,15 @@ bool InstallHandler(Handler handler) {
 	return true;
 }
 
+void SetInstructionPointer(const ExceptionInfo& info, uint64_t rip) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static_cast<PCONTEXT>(info.native_context)->Rip = rip;
+#elif defined(__APPLE__)
+	static_cast<ucontext_t*>(info.native_context)->uc_mcontext->__ss.__rip = rip;
+#else
+	static_cast<ucontext_t*>(info.native_context)->uc_mcontext.gregs[REG_RIP] =
+	    static_cast<greg_t>(rip);
+#endif
+}
+
 } // namespace Common::HostException
