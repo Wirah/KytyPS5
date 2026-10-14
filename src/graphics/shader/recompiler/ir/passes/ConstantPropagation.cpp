@@ -828,6 +828,17 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 			Replace(*source, Value(0u));
 		}
 	}
+	// The forward walk folds a loop header Phi before its back-edge value. Folding the loop
+	// body (or a lane mask projection) can still reduce that value to the preheader's, leaving
+	// a trivial Phi, so fold Phis again until none change.
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto* block: blocks) {
+			for (auto& inst: *block) {
+				if (inst.GetOpcode() == ValueOpcode::Phi) changed |= FoldPhi(inst);
+			}
+		}
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -616,6 +616,35 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+void TestLoopHeaderPhiFoldsAfterLatch() {
+  Fixture fixture(3);
+  auto &entry = fixture.BlockAt(0);
+  auto &header = fixture.BlockAt(1);
+  auto &latch = fixture.BlockAt(2);
+  entry.AddBranch(&header);
+  header.AddBranch(&latch);
+  latch.AddBranch(&header);
+
+  const auto source = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  const auto invariant = fixture.Emit(ValueOpcode::IEqual32, {source, Value(0u)});
+  const auto other = fixture.Emit(ValueOpcode::INotEqual32, {source, Value(1u)});
+  auto &phi = header.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U1));
+  const auto reference = fixture.Emit(ValueOpcode::Reference, {Value(&phi)}, 0, 1);
+  // Only folds after the header was visited, which leaves the Phi trivial.
+  const auto back_edge = fixture.Emit(ValueOpcode::SelectU1, {Value(true), invariant, other}, 0, 2);
+  phi.AddPhiOperand(&entry, invariant);
+  phi.AddPhiOperand(&latch, back_edge);
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+
+  Check(reference.Instruction()->Arg(0) == invariant &&
+            std::ranges::none_of(header, [](const Inst &inst) {
+              return inst.GetOpcode() == ValueOpcode::Phi;
+            }),
+        "loop header Phi made trivial by its latch was not folded");
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -735,6 +764,7 @@ int main() {
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();
+    TestLoopHeaderPhiFoldsAfterLatch();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
