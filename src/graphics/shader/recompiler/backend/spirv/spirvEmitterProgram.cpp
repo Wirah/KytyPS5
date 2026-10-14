@@ -45,14 +45,21 @@ uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
 }
 
 struct DeferredPhiPatch {
-	DeferredPhi     phi;
-	const IR::Inst* instruction = nullptr;
-	uint32_t        half        = 0;
+	DeferredPhi           phi;
+	const IR::Inst*       instruction = nullptr;
+	uint32_t              half        = 0;
+	std::vector<uint32_t> incoming_copies; // By operand; 0 uses the operand's definition.
+};
+
+struct BackEdgeCopy {
+	size_t deferred = 0;
+	size_t operand  = 0;
 };
 
 struct StructuredFunctionState {
-	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
-	std::vector<DeferredPhiPatch>                  deferred_phis;
+	std::unordered_map<const IR::Block*, uint32_t>                  block_exit_labels;
+	std::vector<DeferredPhiPatch>                                   deferred_phis;
+	std::unordered_map<const IR::Block*, std::vector<BackEdgeCopy>> back_edge_copies;
 };
 
 struct DispatcherFunctionState {
@@ -318,9 +325,40 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		structured.deferred_phis.push_back(
 		    {ctx.state.builder.AddDeferredPhi(type, ctx.Result(inst), inst.NumArgs()), &inst,
 		     ctx.half});
+		if (inst.GetType() == IR::Type::U1) {
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				if (!inst.Arg(index).IsImmediate() &&
+				    !structured.block_exit_labels.contains(inst.PhiBlock(index))) {
+					structured.back_edge_copies[inst.PhiBlock(index)].push_back(
+					    {structured.deferred_phis.size() - 1, index});
+				}
+			}
+		}
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
+}
+
+// NVIDIA's SPIR-V compiler widens a bool OpPhi whose incoming values are all translated before
+// it, converting each one at the end of its predecessor. A back-edge predecessor has no
+// terminator yet and the driver dereferences null. A copy defined in that predecessor is still
+// untranslated when the loop header is reached, so the Phi stays bool.
+void EmitBackEdgeCopies(ValueEmitContext& ctx, StructuredFunctionState& structured,
+                        const IR::Block* block) {
+	const auto found = structured.back_edge_copies.find(block);
+	if (found == structured.back_edge_copies.end()) {
+		return;
+	}
+	for (const auto& edge: found->second) {
+		auto&       deferred = structured.deferred_phis[edge.deferred];
+		const auto& phi      = *deferred.instruction;
+		auto&       lane     = deferred.half == 0 ? ctx : *ctx.other_half;
+		const auto  copy     = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCopyObject, TypeId(ctx.state, phi.GetType()), copy,
+		                              lane.Def(phi.Arg(edge.operand)));
+		deferred.incoming_copies.resize(phi.NumArgs());
+		deferred.incoming_copies[edge.operand] = copy;
+	}
 }
 
 void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -377,8 +415,11 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 			if (found == structured.block_exit_labels.end()) {
 				ctx.Fail(*deferred.instruction, "has a predecessor that was not emitted");
 			}
-			ctx.state.builder.PatchDeferredPhi(
-			    deferred.phi, index, lane.Def(deferred.instruction->Arg(index)), found->second);
+			const auto value = index < deferred.incoming_copies.size() &&
+			                           deferred.incoming_copies[index] != 0
+			                       ? deferred.incoming_copies[index]
+			                       : lane.Def(deferred.instruction->Arg(index));
+			ctx.state.builder.PatchDeferredPhi(deferred.phi, index, value, found->second);
 		}
 	}
 }
@@ -392,6 +433,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		EmitBackEdgeCopies(ctx, structured, block);
 		if (IsFaultCheckedLoopHeader(ctx.state, block)) {
 			EmitFaultCheckedLoopHeader(ctx, structured, block);
 			continue;
