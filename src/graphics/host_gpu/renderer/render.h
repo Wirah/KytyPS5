@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -172,6 +174,17 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 
+	// A texture descriptor decoded for one shader image resource (see ResolveTexture).
+	struct TextureDescEntry {
+		bool                                  valid = false;
+		ShaderRecompiler::IR::DescriptorValue value;
+		ShaderRecompiler::IR::ImageResource   resource;
+		TextureCache::ImageDesc               desc;
+		vk::Format                            pixel_format      = vk::Format::eUndefined;
+		vk::Format                            view_format       = vk::Format::eUndefined;
+		bool                                  shader_conversion = false;
+	};
+
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -219,6 +232,18 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	std::vector<GuestRange>               m_written_image_ranges;  // CommitBindings scratch
+	std::vector<GuestRange>               m_written_buffer_ranges; // CommitBindings scratch
+	std::vector<TextureDescEntry>         m_texture_desc_memo = std::vector<TextureDescEntry>(256);
+	// ResolveRenderColorTarget's last description per slot, before the image lookup.
+	struct ColorTargetMemo {
+		bool             valid        = false;
+		uint32_t         mask         = 0;
+		uint32_t         slice_offset = 0;
+		HW::RenderTarget registers {};
+		RenderColorInfo  target;
+	};
+	std::array<ColorTargetMemo, RENDER_COLOR_ATTACHMENTS_MAX> m_color_target_memo {};
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::unique_ptr<MeshDrawRecords>      m_mesh_records; // Created by the first mesh draw.

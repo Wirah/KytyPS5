@@ -217,6 +217,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: image registration is outside the guest address space\n");
 	}
+	InvalidateRegionQueries();
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
@@ -231,6 +232,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	UntrackImage(id);
+	InvalidateRegionQueries();
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
 		EXIT("TextureCache: registered image is outside the guest address space\n");
@@ -458,6 +460,29 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 			}
 		});
 	});
+	return result;
+}
+
+TextureCache::ImageIds TextureCache::FindImagesInRegionCached(uint64_t address, uint64_t size) {
+	auto& memo = m_region_query_memo[((address >> 8u) ^ (address >> 20u) ^ (size >> 6u)) %
+	                                 m_region_query_memo.size()];
+	if (memo.epoch == m_region_epoch && memo.address == address && memo.size == size) {
+		ImageIds cached;
+		for (uint32_t i = 0; i < memo.count; i++) {
+			cached.push_back(memo.ids[i]);
+		}
+		return cached;
+	}
+	auto result = FindImagesInRegion(address, size, false);
+	if (result.size() <= memo.ids.size()) {
+		memo.address = address;
+		memo.size    = size;
+		memo.epoch   = m_region_epoch;
+		memo.count   = static_cast<uint8_t>(result.size());
+		for (uint32_t i = 0; i < memo.count; i++) {
+			memo.ids[i] = result[i];
+		}
+	}
 	return result;
 }
 
@@ -1371,6 +1396,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
 		record.info                 = plane;
+		InvalidateRegionQueries();
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
 	}
@@ -1394,7 +1420,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		    FindImagesInRegionCached(desc.info.data.address, desc.info.data.size);
 		bool block_alias = false;
 
 		for (const auto id: candidates) {

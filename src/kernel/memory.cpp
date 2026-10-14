@@ -222,6 +222,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		++m_version;
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -252,6 +253,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		++m_version;
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -283,6 +285,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		++m_version;
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -298,6 +301,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		++m_version;
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -345,6 +349,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		++m_version;
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -357,6 +362,7 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		++m_version;
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -428,13 +434,25 @@ public:
 			return 0;
 		}
 
-		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
-		    [](uint64_t value, const Range& range) { return value < range.start; });
-		if (vma == m_ranges.begin()) {
-			return 0;
+		// Buffers of consecutive draws often lie in the same range as the previous lookup.
+		auto vma = m_ranges.end();
+		if (m_clamp_hint_version == m_version && m_clamp_hint < m_ranges.size()) {
+			const auto& hint = m_ranges[m_clamp_hint];
+			if (virtual_addr >= hint.start && virtual_addr < End(hint.start, hint.size)) {
+				vma = m_ranges.begin() + static_cast<std::ptrdiff_t>(m_clamp_hint);
+			}
 		}
-		--vma;
+		if (vma == m_ranges.end()) {
+			vma = std::upper_bound(
+			    m_ranges.begin(), m_ranges.end(), virtual_addr,
+			    [](uint64_t value, const Range& range) { return value < range.start; });
+			if (vma == m_ranges.begin()) {
+				return 0;
+			}
+			--vma;
+			m_clamp_hint         = static_cast<size_t>(vma - m_ranges.begin());
+			m_clamp_hint_version = m_version;
+		}
 
 		const auto vma_end = End(vma->start, vma->size);
 		if (virtual_addr < vma->start || virtual_addr >= vma_end ||
@@ -647,6 +665,9 @@ private:
 
 	std::vector<Range> m_ranges;
 	Common::Mutex      m_mutex;
+	uint64_t           m_version            = 0; // changes with every edit of m_ranges
+	size_t             m_clamp_hint         = 0; // ClampRangeSize's last range
+	uint64_t           m_clamp_hint_version = UINT64_MAX;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)

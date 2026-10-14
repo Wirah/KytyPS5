@@ -95,8 +95,25 @@ struct DynamicState {
 	/// Commits the dynamic state to the provided command buffer.
 	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
 
+	// Graphics bindings last recorded into the current command buffer, so a draw that repeats
+	// them records nothing. Invalidate forgets them.
+	static constexpr uint32_t                    MaxVertexBuffers = 32;
+	vk::Pipeline                                 bound_pipeline {};
+	uint32_t                                     bound_vertex_buffers = UINT32_MAX;
+	std::array<vk::Buffer, MaxVertexBuffers>     bound_vertex_handles {};
+	std::array<vk::DeviceSize, MaxVertexBuffers> bound_vertex_offsets {};
+	std::array<vk::DeviceSize, MaxVertexBuffers> bound_vertex_sizes {};
+	vk::Buffer                                   bound_index_buffer {};
+	vk::DeviceSize                               bound_index_offset {};
+	vk::IndexType                                bound_index_type {};
+
 	/// Invalidates all dynamic state to be flushed into the next command buffer.
-	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
+	void Invalidate() {
+		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+		bound_pipeline       = nullptr;
+		bound_vertex_buffers = UINT32_MAX;
+		bound_index_buffer   = nullptr;
+	}
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());

@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -207,6 +208,24 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	// FindImage's region lookups stay valid until an image is registered, unregistered or has its
+	// range re-described; m_region_epoch changes on each of those.
+	struct RegionQueryMemo {
+		uint64_t               address = 0;
+		uint64_t               size    = 0;
+		uint32_t               epoch   = 0;
+		uint8_t                count   = 0;
+		std::array<ImageId, 8> ids {};
+	};
+	std::array<RegionQueryMemo, 256> m_region_query_memo {};
+	uint32_t                         m_region_epoch = 1;
+	[[nodiscard]] ImageIds           FindImagesInRegionCached(uint64_t address, uint64_t size);
+	void                                     InvalidateRegionQueries() noexcept {
+		if (++m_region_epoch == 0) {
+			m_region_query_memo = {};
+			m_region_epoch      = 1;
+		}
+	}
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

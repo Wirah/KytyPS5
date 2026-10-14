@@ -39,25 +39,28 @@ public:
 
 	[[nodiscard]] T& operator[](SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		return *m_slots[id.index]->value;
 	}
 
 	[[nodiscard]] const T& operator[](SlotId id) const noexcept {
 		EXIT_IF(!is_allocated(id));
-		return *m_values[id.index].value;
+		return *m_slots[id.index]->value;
 	}
 
 	[[nodiscard]] T* try_get(SlotId id) noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		return is_allocated(id) ? &*m_slots[id.index]->value : nullptr;
 	}
 
 	[[nodiscard]] const T* try_get(SlotId id) const noexcept {
-		return is_allocated(id) ? &*m_values[id.index].value : nullptr;
+		return is_allocated(id) ? &*m_slots[id.index]->value : nullptr;
 	}
 
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id && id.index < m_values.size() &&
-		       m_values[id.index].generation == id.generation && m_values[id.index].value.has_value();
+		if (!id || id.index >= m_slots.size()) {
+			return false;
+		}
+		const auto* slot = m_slots[id.index];
+		return slot->generation == id.generation && slot->value.has_value();
 	}
 
 	template <typename... Args>
@@ -66,20 +69,21 @@ public:
 		if (m_free_list.empty()) {
 			index = static_cast<uint32_t>(m_values.size());
 			m_values.emplace_back();
+			m_slots.push_back(&m_values.back());
 			m_values.back().value.emplace(std::forward<Args>(args)...);
 		} else {
 			index = m_free_list.back();
 			m_free_list.pop_back();
-			EXIT_IF(m_values[index].value.has_value());
-			m_values[index].value.emplace(std::forward<Args>(args)...);
+			EXIT_IF(m_slots[index]->value.has_value());
+			m_slots[index]->value.emplace(std::forward<Args>(args)...);
 		}
 		++m_size;
-		return SlotId {index, m_values[index].generation};
+		return SlotId {index, m_slots[index]->generation};
 	}
 
 	void erase(SlotId id) noexcept {
 		EXIT_IF(!is_allocated(id));
-		auto& slot = m_values[id.index];
+		auto& slot = *m_slots[id.index];
 		slot.value.reset();
 		if (++slot.generation == 0) {
 			slot.generation = 1;
@@ -93,18 +97,18 @@ public:
 
 	template <typename F>
 	void ForEach(F&& fn) {
-		for (uint32_t index = 0; index < m_values.size(); ++index) {
-			if (m_values[index].value) {
-				fn(SlotId {index, m_values[index].generation}, *m_values[index].value);
+		for (uint32_t index = 0; index < m_slots.size(); ++index) {
+			if (m_slots[index]->value) {
+				fn(SlotId {index, m_slots[index]->generation}, *m_slots[index]->value);
 			}
 		}
 	}
 
 	template <typename F>
 	void ForEach(F&& fn) const {
-		for (uint32_t index = 0; index < m_values.size(); ++index) {
-			if (m_values[index].value) {
-				fn(SlotId {index, m_values[index].generation}, *m_values[index].value);
+		for (uint32_t index = 0; index < m_slots.size(); ++index) {
+			if (m_slots[index]->value) {
+				fn(SlotId {index, m_slots[index]->generation}, *m_slots[index]->value);
 			}
 		}
 	}
@@ -116,6 +120,9 @@ private:
 	};
 
 	std::deque<Slot>             m_values;
+	// m_slots[i] == &m_values[i]: deque elements keep their address as the deque grows, and a
+	// vector index is cheaper than a deque one on every lookup.
+	std::vector<Slot*>           m_slots;
 	std::vector<uint32_t>        m_free_list;
 	size_t                       m_size = 0;
 };

@@ -502,25 +502,19 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
-	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
-		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+// The texture descriptor memo slot of a descriptor value.
+static size_t TextureDescMemoSlot(const ShaderRecompiler::IR::DescriptorValue& value, size_t slots) {
+	uint64_t hash = value.dword_count;
+	for (const auto dword: value.dwords) {
+		hash = (hash ^ dword) * 0x100000001b3ull;
 	}
-	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
-	const bool storage = resource.written;
-	if (storage) {
-		ValidateStorageImageResource(resource);
-	}
+	return static_cast<size_t>(hash ^ (hash >> 29u)) % slots;
+}
 
-	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
-	}
-
+// The part of ResolveTexture that depends only on the shader resource and its descriptor.
+static void ComputeTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
+                               const ShaderTextureResource& descriptor, bool storage,
+                               RenderExecutor::TextureDescEntry& entry) {
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -638,6 +632,44 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	entry.desc              = std::move(desc);
+	entry.pixel_format      = pixel_format;
+	entry.view_format       = view_format;
+	entry.shader_conversion = shader_conversion;
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
+		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
+	}
+	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	const bool storage = resource.written;
+	if (storage) {
+		ValidateStorageImageResource(resource);
+	}
+
+	auto& texture_cache = m_context.GetTextureCache();
+	if (descriptor.IsNull()) {
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+
+	// Descriptors repeat across draws; their decoded image description is reused.
+	auto& entry = m_texture_desc_memo[TextureDescMemoSlot(value, m_texture_desc_memo.size())];
+	if (!entry.valid || entry.value != value || !(entry.resource == resource)) {
+		entry.valid = false;
+		ComputeTextureDesc(resource, descriptor, storage, entry);
+		entry.value    = value;
+		entry.resource = resource;
+		entry.valid    = true;
+	}
+	auto       desc              = entry.desc;
+	const auto pixel_format      = entry.pixel_format;
+	const auto view_format       = entry.view_format;
+	const bool shader_conversion = entry.shader_conversion;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -948,6 +980,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// The ranges written by bound images and shader buffers are the same for every read; gather
+	// them once instead of walking the bound images for each read.
+	bool     written_ranges_ready = false;
+	uint64_t written_begin        = UINT64_MAX; // bounds of all written ranges
+	uint64_t written_end          = 0;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
@@ -956,17 +993,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		if (!written_ranges_ready) {
+			written_ranges_ready = true;
+			m_written_image_ranges.clear();
+			m_written_buffer_ranges.clear();
+			const auto add = [&](std::vector<GuestRange>& ranges, GuestRange written) {
+				if (written.address > UINT64_MAX - written.size) {
+					EXIT("invalid image overlap range\n");
+				}
+				ranges.push_back(written);
+				written_begin = std::min(written_begin, written.address);
+				written_end   = std::max(written_end, written.End());
+			};
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
-					}
+					if (written.size != 0) add(m_written_image_ranges, written);
 				}
 			}
 			for (const auto* writer: prepared_bindings) {
@@ -974,10 +1019,27 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				for (const auto& resource: program.info.buffers) {
 					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					if (written.size != 0) {
+						add(m_written_buffer_ranges, {written.address, written.size});
 					}
+				}
+			}
+		}
+		if (m_written_image_ranges.empty() && m_written_buffer_ranges.empty()) continue;
+		for (const auto [address, size]: reads) {
+			if (size == 0 || address > UINT64_MAX - size) {
+				EXIT("invalid image overlap range\n");
+			}
+			const auto end = address + size;
+			if (end <= written_begin || address >= written_end) continue;
+			for (const auto written: m_written_image_ranges) {
+				if (address < written.End() && written.address < end) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+			}
+			for (const auto written: m_written_buffer_ranges) {
+				if (address < written.End() && written.address < end) {
+					EXIT("scalar resource reads overlap a shader buffer write\n");
 				}
 			}
 		}

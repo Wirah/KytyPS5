@@ -965,23 +965,46 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(vk::CommandBuffer vk_buffer, DynamicState& state,
                                 const PreparedVertexBuffers& prepared) {
+	static_assert(PreparedVertexBuffers::MaxBuffers <= DynamicState::MaxVertexBuffers);
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
 	if (prepared.count != 0) {
+		const auto count = prepared.count;
+		if (state.bound_vertex_buffers == count &&
+		    std::equal(prepared.buffers.begin(), prepared.buffers.begin() + count,
+		               state.bound_vertex_handles.begin()) &&
+		    std::equal(prepared.offsets.begin(), prepared.offsets.begin() + count,
+		               state.bound_vertex_offsets.begin()) &&
+		    std::equal(prepared.sizes.begin(), prepared.sizes.begin() + count,
+		               state.bound_vertex_sizes.begin())) {
+			return;
+		}
 		// Guest descriptor bounds must survive allocation merging in the cache.
-		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
-		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
+		vk_buffer.bindVertexBuffers2(0, count, prepared.buffers.data(), prepared.offsets.data(),
+		                             prepared.sizes.data(), nullptr);
+		state.bound_vertex_buffers = count;
+		std::copy_n(prepared.buffers.begin(), count, state.bound_vertex_handles.begin());
+		std::copy_n(prepared.offsets.begin(), count, state.bound_vertex_offsets.begin());
+		std::copy_n(prepared.sizes.begin(), count, state.bound_vertex_sizes.begin());
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, DynamicState& state,
+                              const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
+	if (state.bound_index_buffer == prepared.buffer && state.bound_index_offset == prepared.offset &&
+	    state.bound_index_type == prepared.type) {
+		return;
+	}
 	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	state.bound_index_buffer = prepared.buffer;
+	state.bound_index_offset = prepared.offset;
+	state.bound_index_type   = prepared.type;
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1216,8 +1239,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		     .primitive_step       = mesh.InputPrimitiveStep(),
 		     .primitives_per_group = mesh.primitives_per_group});
 	}
+	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
+		CommitVertexBuffers(vk_buffer, dynamic_state, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
@@ -1244,10 +1268,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
-		CommitIndexBuffer(vk_buffer, index_binding);
+		CommitIndexBuffer(vk_buffer, dynamic_state, index_binding);
 	}
 
-	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
@@ -1258,7 +1281,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	if (dynamic_state.bound_pipeline != pipeline.pipeline) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		dynamic_state.bound_pipeline = pipeline.pipeline;
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
